@@ -1,0 +1,106 @@
+#!/bin/sh
+
+. /lib/functions.sh
+
+BOOTCONFIG_MTD="$(find_mtd_part 0:bootconfig)"
+BOOTCONFIG1_MTD="$(find_mtd_part 0:bootconfig1)"
+OFFSET=4
+
+get_status() {
+	hexdump -v -e '1/1 "%01x|"' -n 1 -s "$OFFSET" -C "$1" | cut -f 1 -d "|" | head -n1
+}
+
+get_status_string() {
+	case "$1" in
+		0) echo "none" ;;
+		1) echo "backup" ;;
+		2) echo "selected" ;;
+		*) echo "unknown" ;;
+	esac
+}
+
+show_status() {
+
+	echo "Currently booted:"
+	echo "    image$(awk -F'bootImage=' '{print $2}' /proc/cmdline | awk '{print $1}')"
+
+	IMAGE0_STATUS=$(get_status "$BOOTCONFIG_MTD")
+	IMAGE1_STATUS=$(get_status "$BOOTCONFIG1_MTD")
+
+	echo "At next reboot:"
+	echo "    image0: $(get_status_string "$IMAGE0_STATUS")"
+	echo "    image1: $(get_status_string "$IMAGE1_STATUS")"
+
+	if [ "$IMAGE0_STATUS" = "1" ] && [ "$IMAGE1_STATUS" = "1" ]; then
+		echo "WARNING: For some reason both images are marked as selected!"
+		read -rp "Are you sure you want to proceed? (yes/no) " CONFIRM
+		[ "$CONFIRM" != "yes" ] && exit 1
+	fi
+
+}
+
+write_status() {
+	printf "\\x$2" | dd of="$1" bs=1 seek=$OFFSET count=1 conv=notrunc 2>/dev/null
+}
+
+set_image() {
+	IMAGE="$1"
+
+	# Get current status of both image0 and image1
+	IMAGE0_STATUS=$(get_status "$BOOTCONFIG_MTD")
+	IMAGE1_STATUS=$(get_status "$BOOTCONFIG1_MTD")
+
+	if [ "$IMAGE" = "0" ]; then
+		NEW_IMAGE0_STATUS="02"
+		NEW_IMAGE1_STATUS=$([ "$IMAGE1_STATUS" = "0" ] && echo "00" || echo "01")  # Keep "none" if it was "none"
+		IMAGE_MTD="$BOOTCONFIG_MTD"
+		CURRENT_STATUS="$IMAGE0_STATUS"
+		CURRENT_STATUS_OTHER="$IMAGE1_STATUS"
+	elif [ "$IMAGE" = "1" ]; then
+		NEW_IMAGE0_STATUS=$([ "$IMAGE0_STATUS" = "0" ] && echo "00" || echo "01")  # Keep "none" if it was "none"
+		NEW_IMAGE1_STATUS="02"
+		IMAGE_MTD="$BOOTCONFIG1_MTD"
+		CURRENT_STATUS="$IMAGE1_STATUS"
+		CURRENT_STATUS_OTHER="$IMAGE0_STATUS"
+	else
+		echo "ERROR: Invalid image selection. Use 'image0' or 'image1'."
+		exit 1
+	fi
+
+	if [ "$CURRENT_STATUS" = "0" ]; then
+		echo "WARNING: image$IMAGE is currently 'none'. Booting might fail."
+		if [ "$IMAGE0_STATUS" = "0" ]; then
+			echo "INFO: If this is the first boot of OpenWRT after flashing from factory, it is usually safe to proceed."
+		fi
+		read -rp "Are you sure you want to proceed? (yes/no) " CONFIRM
+		[ "$CONFIRM" != "yes" ] && exit 1
+	fi
+
+	echo "Old configuration:"
+	show_status
+	echo
+	echo "Updating image selection..."
+	write_status "$BOOTCONFIG_MTD" "$NEW_IMAGE0_STATUS"
+	write_status "$BOOTCONFIG1_MTD" "$NEW_IMAGE1_STATUS"
+	echo "Done."
+	if [ "$CURRENT_STATUS_OTHER" = "0" ]; then
+		echo "INFO: Did not change 'none'-image to 'backup'. Kept it as 'none'."
+	fi
+	echo
+	echo "New configuration:"
+	show_status
+}
+
+case "$1" in
+	show)
+		show_status
+		;;
+	set)
+		[ -z "$2" ] && { echo "ERROR: Missing image argument. Use 'set image0' or 'set image1'."; exit 1; }
+		set_image "${2#image}"
+		;;
+	*)
+		echo "Usage: $0 {show | set image0 | set image1}"
+		exit 1
+		;;
+esac
